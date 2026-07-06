@@ -22,6 +22,7 @@ The crawler exports `超市商品导出.xlsx` with fixed sheets and fixed `商�
   - `商品月售`
   - `三级类目名称`
   - `三级类目id`
+- Populate `想买的所有商品` when `want_to_Buy` / `want_to_buy_content` exists, including both `想买的前10数据` and `想买的所有数据` sections.
 
 ## Install
 
@@ -55,4 +56,3 @@ npm run supermarket -- \
 ```
 
 The user must manually complete login, location, captcha, or safety verification in Chrome. The crawler does not bypass verification or access controls.
-

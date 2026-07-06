@@ -137,3 +137,27 @@ Header row should be bold and colored:
 - Third category fields (`三级类目名称`, `三级类目id`): green `#548235`
 
 Do not add workbook auto-filter. Keep only fixed headers, colors, widths, and normal cell values.
+
+## Want-To-Buy Sheet
+
+The reference workbook's `想买的所有商品` sheet is not a blank placeholder.
+
+Use product fields:
+
+```json
+{
+  "want_to_Buy": 396,
+  "want_to_buy_content": "396人想买"
+}
+```
+
+Build the sheet with:
+
+1. Header row: `类型` + rank headers.
+2. Section row: `想买的前10数据`.
+3. Top 10 products sorted by want-to-buy count descending.
+4. Separator row: `类型` = single blank space.
+5. Section row: `想买的所有数据`.
+6. All products with want-to-buy data sorted by count descending.
+
+For this sheet only, the `商品月售` column should contain the want-to-buy text, such as `396人想买`, matching the reference workbook.

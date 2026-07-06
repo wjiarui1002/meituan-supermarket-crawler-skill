@@ -153,6 +153,8 @@ describe('product normalizer', () => {
       name: '舒客牙刷',
       month_saled: 0,
       month_saled_content: '月售100+',
+      want_to_Buy: 88,
+      want_to_buy_content: '88人想买',
       min_price: 12.6,
       standardCategorys: [
         { id: 1, name: '个护清洁', level: 1 },
@@ -184,6 +186,8 @@ describe('product normalizer', () => {
     assert.equal(product.discount_info, '7.92折 限1份');
     assert.equal(product.coupon_info, '满19减8');
     assert.equal(product.hand_price, 10.6);
+    assert.equal(product.want_to_buy_count, 88);
+    assert.equal(product.want_to_buy_text, '88人想买');
     assert.equal(product.sku_prices[0].upc, '6920123456789');
   });
 

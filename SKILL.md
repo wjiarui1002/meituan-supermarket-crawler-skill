@@ -156,6 +156,7 @@ Critical rules:
 - 活动价: use `unify_price.activity_info.activity_price`.
 - 到手价: use `unify_price.actual_price_info.actual_price`; leave blank when missing.
 - upc码: prefer SKU `upccode` / `upc`.
+- 想买的所有商品: use `want_to_Buy` / `want_to_buy_content`. Build `想买的前10数据` and `想买的所有数据` sections sorted by want-to-buy count. In this sheet, the `商品月售` column should contain text like `130人想买`, matching the reference workbook.
 - 商品图片ID: if the public H5 interface does not expose the reference image id, keep `0000` as the placeholder.
 
 ## Verification Commands
@@ -200,6 +201,7 @@ Expected checks:
 - `一级分类` and `二级分类` should not be broadly empty.
 - `商品月售` should not be all zero if `月售xx` text exists.
 - `三级类目名称` and `三级类目id` should be populated for supermarket products.
+- `想买的所有商品` should contain data when products have `want_to_Buy` / `want_to_buy_content`; only leave it header-only when the interface truly lacks want-to-buy data.
 - Header row should be bold and colored.
 - Workbook should not contain auto-filter; in `openpyxl`, `ws.auto_filter.ref` should be `None`.
 - Report honest nonempty counts for 到手价/商品折扣/优惠券 because these depend on the store’s actual promotions.

@@ -25,6 +25,8 @@ describe('supermarket exporter', () => {
     discount_info: '满10减1',
     coupon_info: '不参加神券优惠',
     hand_price: 8.9,
+    want_to_buy_count: 130,
+    want_to_buy_text: '130人想买',
     third_category_name: '包装饮用水',
     third_category_id: '200000159',
     sold_out: false,
@@ -167,6 +169,31 @@ describe('supermarket exporter', () => {
     assert.equal(row['优惠券'], '满10减1');
     assert.equal(row['upc码'], '6902083880781');
     assert.equal(row['三级类目名称'], '即食粥');
+  });
+
+  it('builds 想买的所有商品 with top 10 and all want-to-buy products', () => {
+    const products = Array.from({ length: 12 }, (_, index) => ({
+      ...product,
+      product_id: String(1000 + index),
+      product_name: `想买商品${index}`,
+      want_to_buy_count: 12 - index,
+      want_to_buy_text: `${12 - index}人想买`,
+      sku_prices: [{ ...product.sku_prices[0], sku_id: String(2000 + index) }],
+    }));
+
+    const sheets = buildSupermarketSheets({ products });
+    const wantRows = sheets['想买的所有商品'];
+
+    assert.equal(wantRows[0][0], '类型');
+    assert.equal(wantRows[1]['类型'], '想买的前10数据');
+    assert.equal(wantRows[2]['商品名称'], '想买商品0');
+    assert.equal(wantRows[2]['商品月售'], '12人想买');
+    assert.equal(wantRows[11]['商品名称'], '想买商品9');
+    assert.equal(wantRows[12]['类型'], ' ');
+    assert.equal(wantRows[13]['类型'], '想买的所有数据');
+    assert.equal(wantRows.length, 26);
+    assert.equal(wantRows[14]['商品名称'], '想买商品0');
+    assert.equal(wantRows[25]['商品名称'], '想买商品11');
   });
 
   it('builds the expected workbook sheet set and sales rankings', () => {

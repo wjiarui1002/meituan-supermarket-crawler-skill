@@ -113,7 +113,7 @@ export function buildSupermarketSheets({ products = [] } = {}) {
     '数据汇总2': buildSummarySheet(expandedRows, '一级分类', '表格逻辑说明:不排除重复的商品，所有商品都计算在所属的分类里', SUMMARY_HEADERS),
     '各个类目销量前十(店内分类)': withHeaders(['类目名称', ...RANK_HEADERS], topByCategory(detailRows, '一级分类', RANK_HEADERS)),
     '各个类目销量前十(三级类目)': withHeaders(['类目名称', ...RANK_HEADERS], topByCategory(detailRows, '三级类目名称', RANK_HEADERS)),
-    '想买的所有商品': withHeaders(['类型', ...RANK_HEADERS], []),
+    '想买的所有商品': withHeaders(['类型', ...RANK_HEADERS], buildWantToBuyRows(detailRows)),
     '销量排行总明细': withHeaders(RANK_HEADERS, salesRankRows.map(toRankRow)),
     '销售额排行总明细': withHeaders(SALES_AMOUNT_HEADERS, amountRankRows.map(toAmountRankRow)),
     '数据汇总2_三级类目': buildSummarySheet(expandedRows, '三级类目名称', '表格逻辑说明:不排除重复的商品，所有商品都计算在所属的分类里', THIRD_SUMMARY_HEADERS),
@@ -216,7 +216,23 @@ function makeDetailRow(product, sku, { collapseSpecs }) {
     '商品详情内容': clean(raw.detail_content ?? raw.detailContent),
     '描述': clean(raw.description ?? product?.product_review),
     '图片链接': clean(product?.product_image ?? raw.picture),
+    '_想买人数': firstNumber([product?.want_to_buy_count, raw.want_to_Buy, raw.want_to_buy, parseWantToBuyText(product?.want_to_buy_text), parseWantToBuyText(raw.want_to_buy_content)]),
+    '_想买文本': clean(product?.want_to_buy_text ?? raw.want_to_buy_content ?? raw.want_to_Buy_content),
   };
+}
+
+function buildWantToBuyRows(rows) {
+  const sorted = rows
+    .filter((row) => num(row['_想买人数']) > 0)
+    .sort((a, b) => num(b['_想买人数']) - num(a['_想买人数']));
+  if (sorted.length === 0) return [];
+  return [
+    { '类型': '想买的前10数据' },
+    ...sorted.slice(0, 10).map(toWantToBuyRow),
+    { '类型': ' ' },
+    { '类型': '想买的所有数据' },
+    ...sorted.map(toWantToBuyRow),
+  ];
 }
 
 function applyHeaderStyle(worksheet, headers, xlsx) {
@@ -330,6 +346,14 @@ function toAmountRankRow(row) {
   };
 }
 
+function toWantToBuyRow(row) {
+  return {
+    '类型': null,
+    ...toRankRow(row),
+    '商品月售': row['_想买文本'] || `${num(row['_想买人数'])}人想买`,
+  };
+}
+
 function withHeaders(headers, rows) {
   return [
     headers,
@@ -359,6 +383,16 @@ function parseSalesText(value) {
   const text = clean(value);
   if (!text) return null;
   const match = text.match(/月售\s*([0-9]+(?:\.[0-9]+)?)(万)?\+?/);
+  if (!match) return null;
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return null;
+  return Math.round(base * (match[2] ? 10000 : 1));
+}
+
+function parseWantToBuyText(value) {
+  const text = clean(value);
+  if (!text) return null;
+  const match = text.match(/([0-9]+(?:\.[0-9]+)?)(万)?\s*人想买/);
   if (!match) return null;
   const base = Number(match[1]);
   if (!Number.isFinite(base)) return null;

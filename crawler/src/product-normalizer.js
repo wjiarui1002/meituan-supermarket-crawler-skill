@@ -119,6 +119,8 @@ export function normalizeProduct(spu, tag = {}, categoryIndex = 0, context = {})
       primarySku.promotion?.activity_text,
     ]),
     coupon_info: collectCouponTexts(spu, primarySku).join('#') || null,
+    want_to_buy_count: firstNumber([spu?.want_to_Buy, spu?.want_to_buy, parseWantToBuyText(spu?.want_to_buy_content)]),
+    want_to_buy_text: clean(spu?.want_to_buy_content ?? spu?.want_to_Buy_content),
     third_category_name: clean(thirdCategory?.name),
     third_category_id: stringify(thirdCategory?.id),
     product_review: clean(spu?.praise_content),
@@ -261,6 +263,16 @@ function parseSalesText(value) {
   const text = clean(value);
   if (!text) return null;
   const match = text.match(/月售\s*([0-9]+(?:\.[0-9]+)?)(万)?\+?/);
+  if (!match) return null;
+  const base = Number(match[1]);
+  if (!Number.isFinite(base)) return null;
+  return Math.round(base * (match[2] ? 10000 : 1));
+}
+
+function parseWantToBuyText(value) {
+  const text = clean(value);
+  if (!text) return null;
+  const match = text.match(/([0-9]+(?:\.[0-9]+)?)(万)?\s*人想买/);
   if (!match) return null;
   const base = Number(match[1]);
   if (!Number.isFinite(base)) return null;
