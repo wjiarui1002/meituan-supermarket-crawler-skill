@@ -1,0 +1,23 @@
+.DS_Store
+node_modules/
+**/node_modules/
+chrome-profile/
+**/chrome-profile/
+
+# Runtime outputs
+美团评论采集结果/
+美团超市采集结果/
+美团超市采集结果_*/
+美团超市分页验证/
+美团超市采集结果验证/
+**/美团评论采集结果/
+**/美团超市采集结果/
+**/美团超市采集结果_*/
+**/美团超市分页验证/
+**/美团超市采集结果验证/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+
