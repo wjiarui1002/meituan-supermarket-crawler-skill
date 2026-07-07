@@ -194,7 +194,7 @@ function makeDetailRow(product, sku, { collapseSpecs }) {
     '二级分类': clean(product?.second_category_name ?? product?.category_name) ?? null,
     '商品名称': clean(product?.product_name),
     '规格': specs || clean(raw.spec),
-    'sku_id': clean(sku?.sku_id ?? raw.sku_id ?? raw.skuId),
+    'sku_id': clean(sku?.sku_id ?? raw.sku_id ?? raw.skuId) ?? 'NA',
     '商品ID': clean(product?.product_id ?? raw.spu_id ?? raw.id),
     'upc码': clean(sku?.upc ?? rawSku?.upccode ?? rawSku?.upc ?? rawSku?.upc_code ?? rawSku?.upcCode ?? raw.upc ?? raw.upc_code ?? raw.upcCode),
     '现价': currentPrice,

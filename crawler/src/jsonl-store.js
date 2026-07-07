@@ -109,12 +109,76 @@ function mergeMissingFields(existing, incoming) {
   let changed = false;
   for (const [key, value] of Object.entries(incoming)) {
     if (key === '_dedupe_key') continue;
+    if (key === 'sku_prices' && Array.isArray(merged[key]) && Array.isArray(value)) {
+      const { mergedSkus, skuChanged } = mergeSkuPrices(merged[key], value);
+      if (skuChanged) {
+        merged[key] = mergedSkus;
+        changed = true;
+      }
+      continue;
+    }
+    if (key === 'product_detail_json' && shouldReplaceProductDetail(merged[key], value)) {
+      merged[key] = value;
+      changed = true;
+      continue;
+    }
     if (isMissing(merged[key]) && !isMissing(value)) {
       merged[key] = value;
       changed = true;
     }
   }
   return { merged, changed };
+}
+
+function mergeSkuPrices(existingSkus, incomingSkus) {
+  const mergedSkus = existingSkus.map((sku) => ({ ...sku }));
+  const indexByKey = new Map();
+  mergedSkus.forEach((sku, index) => {
+    const key = skuMergeKey(sku);
+    if (key) indexByKey.set(key, index);
+  });
+
+  let skuChanged = false;
+  for (const incoming of incomingSkus) {
+    const key = skuMergeKey(incoming);
+    if (!key || !indexByKey.has(key)) {
+      mergedSkus.push(incoming);
+      if (key) indexByKey.set(key, mergedSkus.length - 1);
+      skuChanged = true;
+      continue;
+    }
+
+    const index = indexByKey.get(key);
+    const before = mergedSkus[index];
+    const merged = { ...before };
+    for (const [field, value] of Object.entries(incoming)) {
+      if (isMissing(merged[field]) && !isMissing(value)) {
+        merged[field] = value;
+      }
+    }
+    if (JSON.stringify(merged) !== JSON.stringify(before)) {
+      mergedSkus[index] = merged;
+      skuChanged = true;
+    }
+  }
+
+  return { mergedSkus, skuChanged };
+}
+
+function skuMergeKey(sku) {
+  if (!sku || typeof sku !== 'object') return null;
+  if (!isMissing(sku.sku_id)) return `id:${sku.sku_id}`;
+  if (!isMissing(sku.id)) return `id:${sku.id}`;
+  if (!isMissing(sku.spec)) return `spec:${sku.spec}`;
+  return null;
+}
+
+function shouldReplaceProductDetail(existing, incoming) {
+  if (isMissing(incoming)) return false;
+  if (isMissing(existing)) return true;
+  const existingSkuCount = Array.isArray(existing?.skus) ? existing.skus.length : 0;
+  const incomingSkuCount = Array.isArray(incoming?.skus) ? incoming.skus.length : 0;
+  return incomingSkuCount > existingSkuCount;
 }
 
 function isMissing(value) {

@@ -122,6 +122,18 @@ describe('supermarket exporter', () => {
     assert.equal(expanded[1]['优惠券'], '不参加神券优惠');
   });
 
+  it('keeps products without sku and marks sku_id as NA', () => {
+    const [row] = productToDetailRows({
+      ...product,
+      product_id: 'no-sku-product',
+      product_name: '接口未返回 SKU 的商品',
+      sku_prices: [],
+    }, { expandSkus: true });
+
+    assert.equal(row['商品名称'], '接口未返回 SKU 的商品');
+    assert.equal(row.sku_id, 'NA');
+  });
+
   it('writes styled header rows so fixed fields are easy to distinguish', async () => {
     const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'supermarket-export-'));
     const outputPath = path.join(tmpDir, 'out.xlsx');

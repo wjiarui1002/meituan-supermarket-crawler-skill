@@ -75,3 +75,33 @@ test('upsertJsonlRecords merges duplicate records by filling missing fields', as
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('upsertJsonlRecords merges sku_prices by sku_id when incoming product detail is richer', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'mt-jsonl-'));
+  try {
+    const file = path.join(dir, 'products.jsonl');
+    await appendJsonlRecords(file, [{
+      _dedupe_key: 'product:1',
+      product_name: '多规格商品',
+      sku_prices: [{ sku_id: 'sku-1', spec: '原味', price: 10 }],
+      product_detail_json: { skus: [{ id: 'sku-1' }] },
+    }], new Set());
+
+    const result = await upsertJsonlRecords(file, [{
+      _dedupe_key: 'product:1',
+      product_name: '多规格商品',
+      sku_prices: [
+        { sku_id: 'sku-1', spec: '原味', price: 10 },
+        { sku_id: 'sku-2', spec: '草莓味', price: 12 },
+      ],
+      product_detail_json: { skus: [{ id: 'sku-1' }, { id: 'sku-2' }] },
+    }]);
+
+    assert.deepEqual(result, { inserted: 0, updated: 1, unchanged: 0 });
+    const parsed = JSON.parse((await readFile(file, 'utf8')).trim());
+    assert.deepEqual(parsed.sku_prices.map((sku) => sku.sku_id), ['sku-1', 'sku-2']);
+    assert.equal(parsed.product_detail_json.skus.length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

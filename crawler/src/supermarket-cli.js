@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { chromium } from 'playwright';
 import { createHash } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import readline from 'node:readline/promises';
@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { shouldParseResponse, summarizePayload } from './api-discovery.js';
 import { CDP_ENDPOINT, OUTPUT_DIR, selectPreferredPage } from './config.js';
 import { appendError, readSeenKeysFromJsonl, upsertJsonlRecords } from './jsonl-store.js';
-import { extractMenuFromPayload } from './product-normalizer.js';
+import { extractMenuFromPayload, fingerprintProduct, normalizeProduct } from './product-normalizer.js';
 import { extractShopFromPageSnapshot, extractShopsFromPayload, fingerprintShop } from './shop-normalizer.js';
 import { exportSupermarketWorkbook, readJsonl, updateFormField } from './supermarket-exporter.js';
 
@@ -23,6 +23,12 @@ const DEFAULTS = {
   scrollDelayMs: 2000,
   categoryClickDelayMs: 1200,
   pageRequestDelayMs: 500,
+  productDetail: true,
+  detailSeedOnly: false,
+  seedWorkbooks: [],
+  detailRequestDelayMs: 120,
+  detailBatchSize: 200,
+  detailConcurrency: 5,
   maxPagesPerCategory: 200,
   pageIndex: 0,
   goto: true,
@@ -64,6 +70,7 @@ export async function run(options) {
       categoryById: new Map(),
       categoryOrderById: new Map(),
       categoryContextById: new Map(),
+      productInfoTemplate: null,
     };
     const paginatedTags = new Set();
     const handleResponse = createResponseHandler({
@@ -112,10 +119,20 @@ export async function run(options) {
     page.off('response', handleResponse);
     await handleResponse.waitForIdle();
 
-    const products = await readJsonl(files.products);
+    let products = await readJsonl(files.products);
     if (products.length === 0) {
       console.log('没有采集到商品。请确认当前 Chrome 页面已打开目标超市、已登录/定位，并可正常看到商品列表。');
       return;
+    }
+
+    if (options.productDetail) {
+      await enrichProductsFromDetailApi({
+        page,
+        files,
+        menuContext,
+        options,
+      });
+      products = await readJsonl(files.products);
     }
 
     await exportSupermarketWorkbook({ products, outputPath: files.workbook });
@@ -171,6 +188,7 @@ async function processResponse(response, { page, files, menuContext, seenProduct
     return;
   }
 
+  rememberProductInfoTemplate(response, menuContext);
   updateCategoryTreeContext(payload, menuContext);
   const requestContext = getRequestCategoryContext(response);
   await ingestPayload({
@@ -196,6 +214,17 @@ async function processResponse(response, { page, files, menuContext, seenProduct
     paginatedTags,
     options,
   });
+}
+
+function rememberProductInfoTemplate(response, menuContext) {
+  const url = response.url();
+  if (!/\/quickbuy\/v1\/poi\/sputag\/products/.test(url)) return;
+  const body = response.request().postData();
+  if (!body) return;
+  menuContext.productInfoTemplate = {
+    url: url.replace('/quickbuy/v1/poi/sputag/products', '/quickbuy/v2/poi/product/info'),
+    body,
+  };
 }
 
 async function ingestPayload({ payload, url, status, page, files, menuContext, requestContext, seenProducts, seenCategories }) {
@@ -341,13 +370,15 @@ async function paginateSputagProducts({
     let nextPayload;
     let status = 0;
     try {
-      const apiResponse = await page.request.post(url, {
+      const result = await requestJsonWithRetry(page, url, {
         headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
         data: body,
         timeout: 30000,
+        attempts: 3,
+        delayMs: Math.max(options.pageRequestDelayMs, 1000),
       });
-      status = apiResponse.status();
-      nextPayload = await apiResponse.json();
+      status = result.status;
+      nextPayload = result.payload;
     } catch (error) {
       await appendError(files.errors, {
         at: new Date().toISOString(),
@@ -356,7 +387,8 @@ async function paginateSputagProducts({
         page_index: pageIndex,
         message: error.message,
       });
-      break;
+      await sleep(options.pageRequestDelayMs);
+      continue;
     }
 
     await ingestPayload({
@@ -376,6 +408,343 @@ async function paginateSputagProducts({
     if (!nextPayload?.data?.has_next_page || listLength === 0) break;
     await sleep(options.pageRequestDelayMs);
   }
+}
+
+async function enrichProductsFromDetailApi({ page, files, menuContext, options }) {
+  const template = menuContext.productInfoTemplate;
+  if (!template?.url || !template?.body) {
+    console.log('未发现商品详情接口模板，跳过详情规格补抓。');
+    return;
+  }
+
+  const products = await readJsonl(files.products);
+  const rowsByProductId = new Map();
+  for (const product of products) {
+    if (!product?.product_id) continue;
+    if (!rowsByProductId.has(product.product_id)) rowsByProductId.set(product.product_id, []);
+    rowsByProductId.get(product.product_id).push(product);
+  }
+
+  const seedByProductId = await collectProductIdSeeds({
+    rawDir: files.rawDir,
+    menuContext,
+    products,
+    seedWorkbooks: options.seedWorkbooks,
+  });
+  const representatives = options.detailSeedOnly
+    ? [...seedByProductId].filter(([productId]) => !rowsByProductId.has(productId)).map(([, seed]) => seed)
+    : [
+        ...new Map([
+          ...[...rowsByProductId.values()].map((rows) => [rows[0].product_id, rows[0]]),
+          ...[...seedByProductId],
+        ]).values(),
+      ];
+  console.log(`开始补抓商品详情/完整规格：${representatives.length} 个唯一商品。`);
+
+  let fetched = 0;
+  let updated = 0;
+  let failed = 0;
+  let pendingRows = [];
+
+  const concurrency = Math.max(1, Math.min(Number(options.detailConcurrency) || 1, representatives.length || 1));
+  console.log(`详情补抓并发：${concurrency}`);
+  for (let index = 0; index < representatives.length; index += concurrency) {
+    const chunk = representatives.slice(index, index + concurrency);
+    const results = await Promise.all(chunk.map((product) => buildProductDetailRows({
+      page,
+      template,
+      product,
+      rowsByProductId,
+      options,
+      files,
+    })));
+
+    for (const result of results) {
+      fetched += 1;
+      if (result.failed) {
+        failed += 1;
+      } else {
+        pendingRows.push(...result.rows);
+      }
+    }
+
+    if (pendingRows.length >= options.detailBatchSize) {
+      const upsertResult = await upsertJsonlRecords(files.products, pendingRows);
+      updated += upsertResult.updated;
+      pendingRows = [];
+    }
+
+    if (fetched % 100 < concurrency || fetched === representatives.length) {
+      console.log(`详情补抓进度：${fetched}/${representatives.length}，更新商品行 ${updated}，失败 ${failed}`);
+    }
+    await sleep(options.detailRequestDelayMs);
+  }
+
+  if (pendingRows.length > 0) {
+    const upsertResult = await upsertJsonlRecords(files.products, pendingRows);
+    updated += upsertResult.updated;
+  }
+
+  console.log(`详情补抓完成：请求 ${fetched}/${representatives.length}，更新商品行 ${updated}，失败 ${failed}`);
+}
+
+async function buildProductDetailRows({ page, template, product, rowsByProductId, options, files }) {
+  try {
+    const result = await fetchProductInfo(page, template, product, options);
+    const detail = result.payload?.data;
+    const detailSkuCount = Array.isArray(detail?.skus) ? detail.skus.length : 0;
+    if (!detail || detailSkuCount === 0) return { rows: [], failed: false };
+
+    const sourceRows = rowsByProductId.get(product.product_id) ?? product._seed_rows ?? [product];
+    const rows = sourceRows.map((row) => {
+      const tag = {
+        tag: row.category_id,
+        id: row.category_id,
+        name: row.category_name,
+        first_category_name: row.first_category_name,
+        second_category_name: row.second_category_name,
+        sequence: row.category_order,
+      };
+      const normalized = normalizeProduct(detail, tag, row.category_order ?? 0, {
+        shopName: row.shop_name,
+        shopUrl: row.shop_url,
+        pageUrl: row.shop_url,
+        poiIdStr: row.poi_id_str,
+        capturedAt: new Date().toISOString(),
+        firstCategoryName: row.first_category_name,
+        secondCategoryName: row.second_category_name,
+      });
+      return {
+        ...normalized,
+        _dedupe_key: row._dedupe_key ?? fingerprintProduct(normalized),
+      };
+    });
+
+    return { rows, failed: false };
+  } catch (error) {
+    await appendError(files.errors, {
+      at: new Date().toISOString(),
+      stage: 'product-info-detail',
+      product_id: product.product_id,
+      product_name: product.product_name,
+      message: error.message,
+    });
+    return { rows: [], failed: true };
+  }
+}
+
+async function collectProductIdSeeds({ rawDir, menuContext, products, seedWorkbooks = [] }) {
+  const seeds = await collectProductIdSeedsFromRaw(rawDir, menuContext, products);
+  for (const seedWorkbook of seedWorkbooks) {
+    const workbookSeeds = await collectProductIdSeedsFromWorkbook(seedWorkbook, products);
+    for (const [productId, seed] of workbookSeeds) {
+      if (!seeds.has(productId)) seeds.set(productId, seed);
+    }
+  }
+  return seeds;
+}
+
+async function collectProductIdSeedsFromRaw(rawDir, menuContext, products) {
+  const fallback = products.find(Boolean) ?? {};
+  const seeds = new Map();
+  let entries = [];
+  try {
+    entries = await readdir(rawDir);
+  } catch {
+    return seeds;
+  }
+
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(await readFile(path.join(rawDir, entry), 'utf8'));
+    } catch {
+      continue;
+    }
+    const data = parsed?.payload?.data;
+    if (!data || typeof data !== 'object') continue;
+    const productIds = extractSeedProductIds(data);
+    if (productIds.length === 0) continue;
+
+    const categoryId = stringifyLocal(data.product_tag_id ?? data.categoryId);
+    const categoryContext = categoryId ? menuContext.categoryContextById.get(categoryId) : null;
+    for (const productId of productIds) {
+      if (!productId || seeds.has(productId)) continue;
+      seeds.set(productId, {
+        product_id: productId,
+        shop_name: fallback.shop_name ?? null,
+        shop_url: fallback.shop_url ?? parsed.page_url ?? null,
+        poi_id_str: fallback.poi_id_str ?? readQueryParamLocal(parsed.page_url, 'poi_id_str'),
+        category_id: categoryId,
+        category_name: categoryContext?.secondCategoryName ?? (categoryId ? menuContext.categoryById.get(categoryId) : null),
+        first_category_name: categoryContext?.firstCategoryName ?? null,
+        second_category_name: categoryContext?.secondCategoryName ?? null,
+        category_order: categoryId ? menuContext.categoryOrderById.get(categoryId) : null,
+        sku_prices: [],
+      });
+    }
+  }
+  return seeds;
+}
+
+async function collectProductIdSeedsFromWorkbook(filePath, products) {
+  const fallback = products.find(Boolean) ?? {};
+  const seeds = new Map();
+  const xlsxModule = await import('xlsx');
+  const xlsx = xlsxModule.default ?? xlsxModule;
+  let workbook;
+  try {
+    workbook = xlsx.readFile(filePath, { cellDates: false });
+  } catch (error) {
+    console.log(`历史种子 Excel 读取失败：${filePath}，${error.message}`);
+    return seeds;
+  }
+
+  const sheet = workbook.Sheets['商品详情'] ?? workbook.Sheets['商品详情-多规格多行显示'];
+  if (!sheet) {
+    console.log(`历史种子 Excel 缺少 商品详情 sheet：${filePath}`);
+    return seeds;
+  }
+
+  const rows = xlsx.utils.sheet_to_json(sheet, { defval: '' });
+  for (const row of rows) {
+    const productId = cleanLocal(row['商品ID']);
+    if (!productId) continue;
+    const skuId = cleanLocal(row.sku_id);
+    const categoryName = cleanLocal(row['二级分类'] ?? row['二级类目名称']);
+    const firstCategoryName = cleanLocal(row['一级分类'] ?? row['一级类目名称']);
+    const secondCategoryName = categoryName;
+    const seedRow = {
+      product_id: productId,
+      product_name: cleanLocal(row['商品名称']),
+      shop_name: fallback.shop_name ?? null,
+      shop_url: fallback.shop_url ?? null,
+      poi_id_str: fallback.poi_id_str ?? null,
+      category_id: null,
+      category_name: categoryName,
+      first_category_name: firstCategoryName,
+      second_category_name: secondCategoryName,
+      category_order: null,
+      sku_prices: skuId && skuId !== 'NA' && skuId !== '#N/A' ? [{ sku_id: skuId }] : [],
+      _seed_source: filePath,
+    };
+    if (seeds.has(productId)) {
+      seeds.get(productId)._seed_rows.push(seedRow);
+      continue;
+    }
+    seeds.set(productId, {
+      ...seedRow,
+      _seed_rows: [seedRow],
+    });
+  }
+
+  console.log(`历史种子 Excel：${filePath}，读取商品 ID ${seeds.size} 个`);
+  return seeds;
+}
+
+function extractSeedProductIds(data) {
+  const ids = new Set();
+  for (const value of [
+    data.allSpuIds,
+    data.allSortedSpuId,
+    data.all_spu_ids,
+    data.all_sorted_spu_id,
+    data.allSpuIdsWithSaleType,
+  ]) {
+    collectSeedIds(value, ids);
+  }
+  return [...ids];
+}
+
+function collectSeedIds(value, ids) {
+  if (value === null || value === undefined || value === '') return;
+  if (typeof value === 'string' || typeof value === 'number') {
+    const id = stringifyLocal(value);
+    if (id && /^\d+$/.test(id)) ids.add(id);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectSeedIds(item, ids));
+    return;
+  }
+  if (typeof value === 'object') {
+    for (const key of ['spu_id', 'spuId', 'id', 'product_id']) collectSeedIds(value[key], ids);
+  }
+}
+
+async function fetchProductInfo(page, template, product, options) {
+  return requestJsonWithRetry(page, template.url, {
+    headers: { 'content-type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+    data: buildProductInfoBody(template.body, product),
+    timeout: 30000,
+    attempts: 3,
+    delayMs: Math.max(options.detailRequestDelayMs, 1000),
+  });
+}
+
+function buildProductInfoBody(templateBody, product) {
+  const params = new URLSearchParams(templateBody || '');
+  const skuId = findPrimarySkuId(product) ?? '0';
+  params.delete('spu_tag_id');
+  params.delete('tag_type');
+  params.delete('page_index');
+  params.set('req_time', String(Date.now()));
+  params.set('client_id', '38');
+  params.set('biz_id', '1137');
+  if (!params.get('wm_uuid') && params.get('uuid')) params.set('wm_uuid', params.get('uuid'));
+  if (!params.get('wm_poi_id')) params.set('wm_poi_id', '-100');
+  if (product.poi_id_str) params.set('poi_id_str', product.poi_id_str);
+  params.set('spu_id', product.product_id);
+  params.set('sku_id', skuId);
+  params.set('share_activity_uuid', 'null');
+  params.set('spu_tag', 'undefined');
+  params.set('activity_tag', 'undefined');
+  params.set('extra', JSON.stringify({ unionId: '', salesId: '', agencyId: '' }));
+  params.set('wm_ctype', 'sg_wxapp');
+  return params.toString();
+}
+
+function findPrimarySkuId(product) {
+  const skus = Array.isArray(product?.sku_prices) ? product.sku_prices : [];
+  for (const sku of skus) {
+    if (sku?.sku_id && sku.sku_id !== 'NA') return String(sku.sku_id);
+  }
+  const rawSkus = Array.isArray(product?.product_detail_json?.skus) ? product.product_detail_json.skus : [];
+  for (const sku of rawSkus) {
+    if (sku?.id) return String(sku.id);
+  }
+  return null;
+}
+
+export async function requestJsonWithRetry(page, url, {
+  headers,
+  data,
+  timeout,
+  attempts = 3,
+  delayMs = 1000,
+} = {}) {
+  let lastError;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    let apiResponse;
+    try {
+      apiResponse = await page.request.post(url, { headers, data, timeout });
+      return {
+        status: apiResponse.status(),
+        payload: await apiResponse.json(),
+      };
+    } catch (error) {
+      let bodyPreview = '';
+      if (apiResponse) {
+        bodyPreview = await apiResponse.text().catch(() => '');
+      }
+      lastError = new Error(bodyPreview
+        ? `${error.message}; body=${bodyPreview.slice(0, 120)}`
+        : error.message);
+      if (attempt < attempts) await sleep(delayMs);
+    }
+  }
+  throw lastError;
 }
 
 async function captureCurrentPageShop(page, { files }) {
@@ -497,11 +866,17 @@ function parseArgs(args) {
     else if (arg === '--scroll-delay-ms') parsed.scrollDelayMs = Number(next), index += 1;
     else if (arg === '--category-click-delay-ms') parsed.categoryClickDelayMs = Number(next), index += 1;
     else if (arg === '--page-request-delay-ms') parsed.pageRequestDelayMs = Number(next), index += 1;
+    else if (arg === '--detail-request-delay-ms') parsed.detailRequestDelayMs = Number(next), index += 1;
+    else if (arg === '--detail-batch-size') parsed.detailBatchSize = Number(next), index += 1;
+    else if (arg === '--detail-concurrency') parsed.detailConcurrency = Number(next), index += 1;
+    else if (arg === '--seed-workbook') parsed.seedWorkbooks.push(next), index += 1;
     else if (arg === '--max-pages-per-category') parsed.maxPagesPerCategory = Number(next), index += 1;
     else if (arg === '--page-index') parsed.pageIndex = Number(next), index += 1;
     else if (arg === '--no-goto') parsed.goto = false;
     else if (arg === '--reload') parsed.reload = true;
     else if (arg === '--no-click-categories') parsed.clickCategories = false;
+    else if (arg === '--no-product-detail') parsed.productDetail = false;
+    else if (arg === '--detail-seed-only') parsed.detailSeedOnly = true;
     else if (arg === '--help' || arg === '-h') {
       printHelp();
       process.exit(0);
@@ -526,10 +901,16 @@ function printHelp() {
   --scroll-delay-ms <ms>   每次滚动间隔，默认 2000
   --category-click-delay-ms <ms> 分类切换间隔，默认 1200
   --page-request-delay-ms <ms> 分类分页请求间隔，默认 500
+  --detail-request-delay-ms <ms> 商品详情/规格补抓间隔，默认 120
+  --detail-batch-size <n>   商品详情合并批量大小，默认 200
+  --detail-concurrency <n>   商品详情并发请求数，默认 5
+  --seed-workbook <xlsx>   读取历史 Excel 的商品ID作为详情补抓种子，可重复传
   --max-pages-per-category <n> 每个分类最多分页数，默认 200
   --page-index <n>         使用已有页面索引，默认 0
   --reload                 监听启动后刷新当前页，重新触发商品接口
   --no-click-categories    不自动切换分类
+  --no-product-detail      不补抓商品详情/完整规格接口
+  --detail-seed-only       只补抓 allSpuIds 种子里当前未入表的商品
 `);
 }
 
@@ -559,6 +940,14 @@ function cleanLocal(value) {
   if (typeof value === 'string') return value.trim() || null;
   if (typeof value === 'number') return String(value);
   return null;
+}
+
+function readQueryParamLocal(url, key) {
+  try {
+    return new URL(url).searchParams.get(key);
+  } catch {
+    return null;
+  }
 }
 
 if (fileURLToPath(import.meta.url) === process.argv[1]) {
